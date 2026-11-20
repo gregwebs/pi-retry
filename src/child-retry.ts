@@ -11,6 +11,7 @@ import {
   getLastAssistantMessage,
   hasEmptyStop,
   hasMaxTokensStop,
+  hasModelUnavailableError,
   hasQuotaExhaustedError,
   hasRetryableError,
   isAssistantMessage,
@@ -23,14 +24,26 @@ import {
   calculateDelay,
   ContinuationState,
   formatRetryCountdown,
+  formatWaitNotice,
   RETRY_STATUS_KEY,
   RetryState,
+  summarizeError,
 } from "./retry-logic.js";
+import { isHeadlessContext, reportHeadless } from "./headless-report.js";
 import type { PiRetrySubagentsConfig } from "./config.js";
 import { removeErrorFromRetryContext } from "./session-registry.js";
 
 /** The hidden turn kinds that can continue an owned child prompt. */
 export type ChildHiddenTurnKind = "retry" | "continue" | "empty";
+
+/**
+ * Error excerpt length embedded in one-line notifications.
+ *
+ * The provider's cause and hint can sit past the first request line, so this
+ * stays long enough for messages such as Antigravity's "This model is
+ * unavailable right now (...)" after its ~100-character request prefix.
+ */
+const NOTIFICATION_ERROR_LIMIT = 200;
 
 /** Retry state grouped by the category shown in child diagnostics. */
 export interface ChildRetryStatus {
@@ -97,6 +110,8 @@ export class ChildRetryController {
   private nextLifecycleId = 0;
   /** Generation of an error retry waiting for the settle boundary. */
   private pendingBoundaryRetry: number | undefined;
+  /** Error text the active backoff is answering, for headless diagnostics. */
+  private lastErrorMessage: string | undefined;
 
   /**
    * Create the controller for one exact AgentSession identity.
@@ -178,9 +193,11 @@ export class ChildRetryController {
       if (!isSilencedError(lastAssistant)) {
         this.notify(
           ctx,
-          hasQuotaExhaustedError(lastAssistant)
-            ? `Quota/limit exhausted - not retrying: ${errorMsg.substring(0, 100)}`
-            : `Non-retryable error (not retried): ${errorMsg.substring(0, 100)}`,
+          hasModelUnavailableError(lastAssistant)
+            ? `Provider reports the model unavailable (it already exhausted its own fallbacks) - not retrying, switch models: ${summarizeError(errorMsg, NOTIFICATION_ERROR_LIMIT)}`
+            : hasQuotaExhaustedError(lastAssistant)
+              ? `Quota/limit exhausted - not retrying: ${summarizeError(errorMsg, NOTIFICATION_ERROR_LIMIT)}`
+              : `Non-retryable error (not retried): ${summarizeError(errorMsg, NOTIFICATION_ERROR_LIMIT)}`,
           "warning",
         );
       }
@@ -196,6 +213,7 @@ export class ChildRetryController {
     const state = this.states[category] ?? this.states.other;
     if (state.getIsRetrying()) return;
     state.startRetry(errorMsg);
+    this.lastErrorMessage = errorMsg;
     try {
       await this.schedule("retry", ctx, manual);
     } finally {
@@ -379,6 +397,9 @@ export class ChildRetryController {
       // An automatic error retry can continue the active run without a message;
       // a manual retry starts from idle, where only a queued message can.
       const messageFree = kind === "retry" && !manual && this.config.messageFreeRetries === true;
+      // A UI-less host (pi -p, --mode json) shows neither the countdown nor
+      // notifications, so announce the wait on stderr before it starts.
+      this.reportHeadlessRetryWait(ctx, kind, attempt, delay);
       // Remove the failed response from Pi's canonical projection before retrying.
       // The helper keeps raw history intact on newer SDKs and falls back to the
       // live Agent state on older versions. The message-free path omits it
@@ -546,6 +567,7 @@ export class ChildRetryController {
     this.emptyNudges = 0;
     this.maxDelayRetries = 0;
     this.retryAttempt = 0;
+    this.lastErrorMessage = undefined;
   }
 
   /**
@@ -615,6 +637,32 @@ export class ChildRetryController {
   }
 
   /**
+   * Announce one retry backoff on stderr for hosts that expose no UI.
+   *
+   * Continuations are excluded: their own notification (max tokens / empty
+   * response) is mirrored to stderr by {@link notify}, and one event must not
+   * produce two diagnostic lines.
+   *
+   * @param ctx SDK context used for UI output and mode detection.
+   * @param kind Type of hidden turn the wait precedes.
+   * @param attempt Ordinary retry attempt number driving the delay.
+   * @param delayMs Milliseconds about to be waited.
+   */
+  private reportHeadlessRetryWait(
+    ctx: ExtensionContext,
+    kind: ChildHiddenTurnKind,
+    attempt: number,
+    delayMs: number,
+  ): void {
+    if (kind !== "retry" || !isHeadlessContext(ctx)) return;
+    reportHeadless(formatWaitNotice(
+      `Retry attempt ${attempt}`,
+      delayMs,
+      this.lastErrorMessage,
+    ));
+  }
+
+  /**
    * Send a diagnostic notification through the current child context.
    *
    * @param ctx SDK context used for UI output.
@@ -631,5 +679,8 @@ export class ChildRetryController {
     } catch {
       // Headless/closing child UIs are advisory and must not break retries.
     }
+    // No UI context means the notification is discarded; stderr is the only
+    // channel a print/JSON host shows to the user.
+    if (isHeadlessContext(ctx)) reportHeadless(message);
   }
 }

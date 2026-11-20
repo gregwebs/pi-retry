@@ -221,6 +221,12 @@ Exhausted quotas, session limits, and budgets are auto-detected and stop the ret
 
 Deliberate distinction: plain pay-as-you-go **balance** errors stay retryable — DeepSeek 402 "Insufficient Balance", OpenRouter 402 "Insufficient credits", Kimi "exceeded your current token quota". A mid-session top-up lets the retry loop auto-resume, whereas session limits and budgets do not self-resolve for hours.
 
+### Non-Retryable (Provider-Exhausted Model Availability)
+Some providers run their own fallback strategy and word the final failure as "switch models". Retrying re-opens exactly that strategy against a backend that already refuses every model, so these stop the loop immediately instead of burning the backoff:
+- **Antigravity** — "This model is unavailable right now (Resource has been exhausted (e.g. check quota).). Next: switch to … model." arrives after pi-antigravity has already tried its endpoint fallbacks (daily → sandbox → production), sibling model tiers, and outer attempts, i.e. up to ~12 requests per attempt. The account's quota pools are typically untouched (`remainingFraction: 1`), so there is no reset window to wait out.
+
+Deliberate distinction: a bare `429 RESOURCE_EXHAUSTED` / "check quota" with no such wording stays retryable (ordinary throttling), as does any error that states a reset time.
+
 ### Max Tokens (stopReason: "length")
 - The model hit its `max_tokens` / output token limit
 - The model's response was truncated mid-generation
@@ -299,7 +305,7 @@ npm run lint:dead
 
 ```bash
 # Run all quality checks
-npm test              # 224 tests
+npm test              # 324 tests
 npm run typecheck     # TypeScript type checking
 npm run lint:dead     # Dead code detection with knip
 ```
@@ -325,6 +331,14 @@ Use the status command to diagnose:
 ### Want to see what's happening?
 
 The extensions send notifications on retry attempts. Look at the footer status line for retry status updates. Non-retryable errors are logged as errors so you know why we stopped.
+
+In print and JSON mode (`pi -p`, `pi --mode json`) there is no footer and no UI context, so notifications would be discarded. There the extension mirrors each retry, continuation, give-up, and non-retryable diagnostic to stderr as one `[pi-retry] …` line — a backoff never looks like a hang:
+
+```
+[pi-retry] Retry attempt 1 - waiting 2.0s after: fetch failed
+```
+
+stderr is used deliberately: stdout carries the assistant text (print) or the JSON event stream (JSON mode).
 
 ### Too many retries?
 

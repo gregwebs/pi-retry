@@ -6,7 +6,7 @@
  * effective system prompt because that is the pi-subagents launch evidence.
  */
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -749,6 +749,39 @@ describe("prompt-scoped ordinary sessions", () => {
     }
   });
 
+  it("reports retry progress on stderr when the host has no UI", async () => {
+    // `pi -p` and `--mode json` bind extensions without a UI context, so the
+    // footer countdown is invisible. Issue #1 reported five minutes of silence
+    // in that mode; a backoff must announce itself on stderr instead.
+    const harness = await createChildHarness(
+      [
+        fauxAssistantMessage("first request failed", {
+          stopReason: "error",
+          errorMessage: "fetch failed\nsocket hang up",
+        }),
+        fauxAssistantMessage("recovered without a UI"),
+      ],
+      30,
+      { childMarker: false },
+    );
+    const writes: string[] = [];
+    const write = vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => {
+      writes.push(String(chunk));
+      return true;
+    });
+    try {
+      await harness.session.prompt("Recover inside a UI-less print host.");
+    } finally {
+      write.mockRestore();
+      await harness.close();
+    }
+
+    expect(harness.session.getLastAssistantText()).toBe("recovered without a UI");
+    expect(writes.join("")).toContain(
+      "[pi-retry] Retry attempt 1 - waiting 30ms after: fetch failed socket hang up",
+    );
+  });
+
   it("does not retry an unmatched print-mode prompt after abort", async () => {
     const harness = await createChildHarness(
       [
@@ -1023,6 +1056,35 @@ describe("message-free retries", () => {
       await harness.close();
     }
   });
+
+  // A UI-less host gets exactly one diagnostic per continuation: the
+  // continuation notice itself, not one notice plus a second backoff line.
+  it("reports one stderr line per continuation for a host without a UI", async () => {
+    const harness = await createChildHarness(
+      [
+        fauxAssistantMessage("partial answer", { stopReason: "length" }),
+        fauxAssistantMessage("completed length continuation"),
+      ],
+      0,
+    );
+    const writes: string[] = [];
+    const write = vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => {
+      writes.push(String(chunk));
+      return true;
+    });
+    try {
+      await harness.session.prompt("Continue the truncated answer without a UI.");
+    } finally {
+      write.mockRestore();
+      await harness.close();
+    }
+
+    // No retry happens here, so the continuation notice must be the only line:
+    // a second line means the wait announcement duplicated the event.
+    const lines = writes.join("").split("\n").filter(line => line.length > 0);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("Max tokens reached - auto-continuing");
+  });
 });
 
 /**
@@ -1272,6 +1334,54 @@ describe("native child retry risk coverage", () => {
     } finally {
       await harness.close();
     }
+  });
+
+  // Issue #1: pi-antigravity words a generic 429 as "This model is unavailable
+  // right now" after running its own endpoint/tier ladder. Retrying that
+  // message multiplied the provider's ladder and cost ~5 minutes of silent
+  // backoff in print mode before the error surfaced.
+  it("surfaces Antigravity's provider-exhausted model-unavailable error without retrying", async () => {
+    const antigravityModelUnavailable = [
+      "Antigravity API error (request-failed, endpoint=https://cloudcode-pa.googleapis.com, project=aicode-consumers):",
+      "This model is unavailable right now (Resource has been exhausted (e.g. check quota).).",
+      "Next: switch to gemini-3.8-flash or another Flash model.",
+      "This is not necessarily an account quota wall.",
+    ].join("\n");
+    const harness = await createChildHarness(
+      [
+        fauxAssistantMessage("antigravity request failed", {
+          stopReason: "error",
+          errorMessage: antigravityModelUnavailable,
+        }),
+        fauxAssistantMessage("must not retry a provider-exhausted model"),
+      ],
+      30,
+      { childMarker: false },
+    );
+    const writes: string[] = [];
+    const write = vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => {
+      writes.push(String(chunk));
+      return true;
+    });
+    try {
+      await harness.session.prompt("Report the unavailable model immediately.");
+    } finally {
+      write.mockRestore();
+      await harness.close();
+    }
+
+    // One provider request: no retry turn, no hidden retry message.
+    expect(harness.faux.state.callCount).toBe(1);
+    expect(harness.faux.getPendingResponseCount()).toBe(1);
+    expect(harness.session.messages.filter(message => message.role === "custom")).toHaveLength(0);
+    // The actionable reason reaches a UI-less host instead of a silent stall.
+    const diagnostics = writes.join("");
+    expect(diagnostics).toContain("[pi-retry] Provider reports the model unavailable");
+    expect(diagnostics).toContain("switch models");
+    expect(diagnostics).toContain("Resource has been exhausted");
+    // One diagnostic is one log line even though the provider message wraps.
+    const lines = diagnostics.split("\n").filter(line => line.length > 0);
+    expect(lines.every(line => line.startsWith("[pi-retry] "))).toBe(true);
   });
 
   // TEST:__tests__/integration/native-child-lifecycle.test.ts[abort during backoff]

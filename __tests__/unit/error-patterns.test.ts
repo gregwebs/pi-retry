@@ -11,6 +11,7 @@ import {
   hasRetryableError,
   isNonRetryableError,
   isSilencedError,
+  hasModelUnavailableError,
   hasQuotaExhaustedError,
   hasMaxTokensStop,
   hasEmptyStop,
@@ -562,6 +563,53 @@ describe('quota patterns do not false-positive on transient/balance errors', () 
     const msg = createAssistantError('The engine is currently overloaded, please try again later');
     expect(hasQuotaExhaustedError(msg)).toBe(false);
     expect(hasRetryableError(msg)).toBe(true);
+  });
+});
+
+describe('provider-exhausted model availability errors', () => {
+  const createAssistantError = (errorMessage: string): AgentMessage =>
+    ({ role: 'assistant', stopReason: 'error', errorMessage, content: [] } as unknown as AgentMessage);
+
+  // Verbatim pi-antigravity 0.14.0 message reported in issue #1. Antigravity
+  // runs its own endpoint x tier ladder (up to ~12 requests per attempt) and
+  // words a generic 429 as non-retryable on purpose so the caller switches
+  // models instead of burning another retry budget.
+  const antigravityModelUnavailable = [
+    'Antigravity API error (request-failed, endpoint=https://cloudcode-pa.googleapis.com, project=aicode-consumers):',
+    'This model is unavailable right now (Resource has been exhausted (e.g. check quota).).',
+    'Next: switch to gemini-3.8-flash or another Flash model.',
+    'This is not necessarily an account quota wall.',
+  ].join('\n');
+
+  it('detects the provider-exhausted "model unavailable" message', () => {
+    expect(hasModelUnavailableError(createAssistantError(antigravityModelUnavailable))).toBe(true);
+    expect(hasModelUnavailableError(createAssistantError('This model is unavailable right now'))).toBe(true);
+  });
+
+  it('does not retry the provider-exhausted message', () => {
+    const msg = createAssistantError(antigravityModelUnavailable);
+    expect(isNonRetryableError(msg)).toBe(true);
+    expect(hasRetryableError(msg)).toBe(false);
+    expect(isSilencedError(msg)).toBe(false);
+  });
+
+  it('leaves a plain mid-session 429 retryable', () => {
+    const msg = createAssistantError('HTTP 429 RESOURCE_EXHAUSTED: Resource has been exhausted (e.g. check quota).');
+    expect(hasModelUnavailableError(msg)).toBe(false);
+    expect(hasQuotaExhaustedError(msg)).toBe(false);
+    expect(hasRetryableError(msg)).toBe(true);
+  });
+
+  it('leaves a reset-hint quota wall classified as quota', () => {
+    const msg = createAssistantError('You have exhausted your capacity on this model. Your quota will reset after 8h44m7s.');
+    expect(hasModelUnavailableError(msg)).toBe(false);
+    expect(hasQuotaExhaustedError(msg)).toBe(true);
+    expect(hasRetryableError(msg)).toBe(false);
+  });
+
+  it('returns false for non-error messages', () => {
+    const msg = { role: 'assistant', stopReason: 'stop', content: [] } as unknown as AgentMessage;
+    expect(hasModelUnavailableError(msg)).toBe(false);
   });
 });
 
