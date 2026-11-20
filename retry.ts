@@ -13,12 +13,15 @@ import {
   hasEmptyStop,
   isContextOverflowError,
   isAssistantMessage,
+  hasModelUnavailableError,
   getLastAssistantMessage,
   calculateDelay,
   DEFAULT_RETRY_CONFIG,
   loadPiRetrySettings,
   formatDuration,
   formatRetryCountdown,
+  formatWaitNotice,
+  summarizeError,
   getErrorCategory,
   RETRY_STATUS_KEY,
   RetryState,
@@ -27,6 +30,7 @@ import {
   CONTINUATION_CUSTOM_TYPE,
 } from "./src/index.js";
 import { ChildRetryController } from "./src/child-retry.js";
+import { isHeadlessContext, reportHeadless } from "./src/headless-report.js";
 import {
   getRetrySession,
   getSessionAgent,
@@ -98,6 +102,10 @@ const stateContinuation = new ContinuationState();
 // Empty/think-only stop continuation state is bounded by design.
 const stateEmptyStop = new ContinuationState();
 const MAX_EMPTY_CONTINUATIONS = 1;
+
+// Error excerpt length in one-line notifications: long enough to keep the
+// provider's cause/hint after a request-line prefix, short enough for a footer.
+const NOTIFICATION_ERROR_LIMIT = 200;
 
 // Abort flag for the ordinary session's detached retry loop.
 let _userAborted = false;
@@ -285,6 +293,9 @@ function readEffectiveSystemPrompt(ctx: { getSystemPrompt?: () => string }): str
 export default function (pi: ExtensionAPI) {
   let _notifyFn: ((message: string, level: "info" | "warning" | "error") => void) | null = null;
   let _setStatusFn: ((text: string | undefined) => void) | null = null;
+  // Print and JSON hosts expose no UI: notifications and the footer countdown
+  // are discarded there, so retry progress is mirrored to stderr instead.
+  let _headless = false;
   // Successful turns can occur inside a run before waitForIdle observes its final error.
   // TEST:__tests__/unit/user-retry-regression.test.ts[restarts ordinary backoff after tool success inside the same run]
   let successGeneration = 0;
@@ -613,12 +624,15 @@ export default function (pi: ExtensionAPI) {
     // (silenced errors are neither retried nor shown)
     if (isNonRetryableError(lastAssistant) && !isSilencedError(lastAssistant)) {
       const errorMsg = lastAssistant.errorMessage || "Unknown error";
-      ctx.ui.notify(
-        hasQuotaExhaustedError(lastAssistant)
-          ? `Quota/limit exhausted — not retrying (fix plan/billing or wait for the reset window, then /retry): ${errorMsg.substring(0, 100)}`
-          : `Non-retryable error (not retried): ${errorMsg.substring(0, 100)}`,
-        "error",
-      );
+      const excerpt = summarizeError(errorMsg, NOTIFICATION_ERROR_LIMIT);
+      const message = hasModelUnavailableError(lastAssistant)
+        ? `Provider reports the model unavailable — not retrying (it already exhausted its own fallbacks; switch models): ${excerpt}`
+        : hasQuotaExhaustedError(lastAssistant)
+          ? `Quota/limit exhausted — not retrying (fix plan/billing or wait for the reset window, then /retry): ${excerpt}`
+          : `Non-retryable error (not retried): ${excerpt}`;
+      ctx.ui.notify(message, "error");
+      // Print/JSON hosts discard UI notifications; stderr is their only channel.
+      if (isHeadlessContext(ctx)) reportHeadless(message);
     }
   });
 
@@ -786,14 +800,18 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      // Non-retryable errors (permanent failures + quota/budget
-      // exhaustion): report clearly instead of the generic fallback.
+      // Non-retryable errors (permanent failures, quota/budget exhaustion,
+      // provider-exhausted model availability): report the action instead of
+      // the generic fallback.
       if (isNonRetryableError(lastAssistant)) {
         const errorMsg = lastAssistant.errorMessage || "Unknown error";
+        const excerpt = summarizeError(errorMsg, NOTIFICATION_ERROR_LIMIT);
         ctx.ui.notify(
-          hasQuotaExhaustedError(lastAssistant)
-            ? `Quota/limit exhausted — resolve the plan/billing issue or wait for the reset window first: ${errorMsg.substring(0, 100)}`
-            : `Non-retryable error (fix the underlying issue first, then /retry): ${errorMsg.substring(0, 100)}`,
+          hasModelUnavailableError(lastAssistant)
+            ? `The provider reports this model unavailable — switch models instead of retrying (it already exhausted its own fallbacks): ${excerpt}`
+            : hasQuotaExhaustedError(lastAssistant)
+              ? `Quota/limit exhausted — resolve the plan/billing issue or wait for the reset window first: ${excerpt}`
+              : `Non-retryable error (fix the underlying issue first, then /retry): ${excerpt}`,
           "warning",
         );
         return;
@@ -1007,6 +1025,12 @@ export default function (pi: ExtensionAPI) {
           didRetryComplete = true;
           return;
         }
+        // Capture the failure text before the error leaves the context so a
+        // UI-less host can name the reason in its stderr report.
+        const failedMessage = myAgent.state.messages[myAgent.state.messages.length - 1];
+        const retryErrorMessage = hiddenTurnKind === "retry" && failedMessage && isAssistantMessage(failedMessage)
+          ? failedMessage.errorMessage
+          : undefined;
         removeErrorFromRetryContext(sessionManager, myAgent);
 
         // Empty-stop cap: a model that produced no usable output and answers
@@ -1038,6 +1062,19 @@ export default function (pi: ExtensionAPI) {
         const isMaxDelay = delay >= retryConfig.maxDelayMs;
         if (hiddenTurnKind === "retry" && isMaxDelay) {
           maxDelayRetries++;
+        }
+        // A UI-less host shows neither notifications nor the countdown, so
+        // announce the wait on stderr before it starts.
+        if (_headless) {
+          reportHeadless(formatWaitNotice(
+            hiddenTurnKind === "retry"
+              ? `Retry attempt ${delayAttempt}`
+              : hiddenTurnKind === "empty"
+                ? "Continuation after empty response"
+                : "Continuation after max tokens",
+            delay,
+            hiddenTurnKind === "retry" ? retryErrorMessage : undefined,
+          ));
         }
 
         // Interruptible sleep with backoff BEFORE the retry attempt. The
@@ -1153,6 +1190,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   function notifySafely(message: string, level: "info" | "warning" | "error"): void {
+    if (_headless) reportHeadless(message);
     if (!_notifyFn) return;
     try {
       _notifyFn(message, level);
@@ -1199,6 +1237,7 @@ export default function (pi: ExtensionAPI) {
     _setStatusFn = typeof ctx.ui.setStatus === "function"
       ? text => ctx.ui.setStatus(RETRY_STATUS_KEY, text)
       : null;
+    _headless = isHeadlessContext(ctx);
   });
 
   pi.on("turn_end", async (_event, ctx) => {
@@ -1210,5 +1249,6 @@ export default function (pi: ExtensionAPI) {
         ? text => ctx.ui.setStatus(RETRY_STATUS_KEY, text)
         : null;
     }
+    _headless = isHeadlessContext(ctx);
   });
 }

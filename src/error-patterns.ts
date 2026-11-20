@@ -131,6 +131,27 @@ const SILENCED_PATTERNS = [
   /cannot continue from message role/i,
 ];
 
+// Provider-exhausted availability failures: the provider already ran its own
+// fallback strategy and is telling the caller to switch models. Retrying here
+// re-opens exactly the ladder the provider just walked (endpoints x sibling
+// tiers x outer attempts) against a backend that refuses every model, so it
+// multiplies load and delays the actionable message by the whole backoff.
+//
+// Evidence (pi-antigravity 0.14.0, issue #1): a generic 429 RESOURCE_EXHAUSTED
+// with no reset hint is worded as non-retryable on purpose —
+//   "This model is unavailable right now (Resource has been exhausted (e.g.
+//    check quota).). Next: switch to gemini-3.8-flash or another Flash model."
+// after its own endpoint fallbacks, sibling tiers, and outer attempts (~12
+// requests per attempt). The account pools were untouched (remainingFraction
+// 1) while the generation path 429'd every model, so waiting cannot help.
+//
+// Kept out on purpose: bare 429 / RESOURCE_EXHAUSTED / "check quota" — those
+// are ordinary throttling that pi's built-in retry and pi-retry still recover
+// from, and a genuinely transient model blip is still worth one retry.
+const MODEL_UNAVAILABLE_PATTERNS = [
+  /this model is unavailable right now/i, // Antigravity's "switch models" message
+];
+
 // Quota / session-limit / budget exhaustion — hard stops:
 // retrying is pointless until the user upgrades, tops up a budget, or waits
 // out a reset window measured in hours/days. Distinct from per-minute rate
@@ -284,8 +305,25 @@ export function isNonRetryableError(message: AgentMessage): boolean {
   if (message.stopReason !== "error" || !message.errorMessage) return false;
   return (
     NON_RETRYABLE_PATTERNS.some(p => p.test(message.errorMessage!)) ||
-    QUOTA_EXHAUSTED_PATTERNS.some(p => p.test(message.errorMessage!))
+    QUOTA_EXHAUSTED_PATTERNS.some(p => p.test(message.errorMessage!)) ||
+    MODEL_UNAVAILABLE_PATTERNS.some(p => p.test(message.errorMessage!))
   );
+}
+
+/**
+ * Returns true when the provider reports the model itself as unavailable after
+ * exhausting its own fallbacks. Retrying would multiply the provider's ladder,
+ * and its message already tells the user to switch models, so these are
+ * treated as non-retryable.
+ *
+ * Distinct from quota exhaustion: the account's pools may be untouched, and no
+ * reset window exists to wait out. Kept separate from QUOTA_EXHAUSTED_PATTERNS
+ * so the notification can say "switch models" instead of "fix plan/billing".
+ */
+export function hasModelUnavailableError(message: AgentMessage): boolean {
+  if (!isAssistantMessage(message)) return false;
+  if (message.stopReason !== "error" || !message.errorMessage) return false;
+  return MODEL_UNAVAILABLE_PATTERNS.some(p => p.test(message.errorMessage!));
 }
 
 /**

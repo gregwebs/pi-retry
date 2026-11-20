@@ -58,7 +58,7 @@ function createMockAPI() {
   return { api, handlers, commands };
 }
 
-function createMockCtx(entries: unknown[] = []) {
+function createMockCtx(entries: unknown[] = [], options: { hasUI?: boolean } = {}) {
   const sessionManager = activeMockSessionManager ?? { getEntries: vi.fn() };
   sessionManager.getEntries.mockReturnValue(entries);
   if (activeMockAgent && activeMockSessionManager && activeMockOwner) {
@@ -71,6 +71,8 @@ function createMockCtx(entries: unknown[] = []) {
   }
   return {
     ui: { notify: vi.fn(), setStatus: vi.fn() },
+    // Pi reports false for print/JSON hosts; omit it to model a UI host.
+    ...(options.hasUI === undefined ? {} : { hasUI: options.hasUI }),
     sessionManager,
   } as any;
 }
@@ -260,6 +262,61 @@ describe("smoke: full retry lifecycle", () => {
 
       expect(agent.prompt).not.toHaveBeenCalled();
     } finally {
+      restore();
+    }
+  });
+
+  it("does not retry a provider-exhausted model-unavailable error", async () => {
+    const { handlers, restore } = await setup();
+    try {
+      const errorMessage = "This model is unavailable right now (Resource has been exhausted (e.g. check quota).). Next: switch to gemini-3.8-flash or another Flash model.";
+      const agent = await createAgentWithMessages(
+        [{ role: "assistant", stopReason: "error", errorMessage, content: [] }],
+        vi.fn().mockResolvedValue(undefined)
+      );
+      const ctx = createMockCtx([errorEntry(errorMessage)]);
+
+      for (const fn of handlers["agent_end"] ?? []) {
+        void fn({ messages: [] }, ctx);
+      }
+
+      await advance(10000);
+
+      expect(agent.prompt).not.toHaveBeenCalled();
+      expect(ctx.ui.notify).toHaveBeenCalledWith(
+        expect.stringContaining("Provider reports the model unavailable"),
+        "error",
+      );
+    } finally {
+      restore();
+    }
+  });
+
+  it("reports retry progress on stderr for a host without a UI", async () => {
+    const { handlers, restore } = await setup();
+    const write = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    try {
+      const agent = await createAgentWithMessages(
+        [{ role: "assistant", stopReason: "error", errorMessage: "Connection error", content: [] }],
+        vi.fn().mockImplementation(() => {
+          agent.state.messages = [
+            { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] },
+          ];
+          return Promise.resolve();
+        })
+      );
+      const ctx = createMockCtx([errorEntry("Connection error")], { hasUI: false });
+
+      for (const fn of handlers["agent_end"] ?? []) {
+        void fn({ messages: [] }, ctx);
+      }
+
+      await advance(5000);
+
+      const diagnostics = write.mock.calls.map(call => String(call[0])).join("");
+      expect(diagnostics).toContain("[pi-retry] Retry attempt 1 - waiting 2.0s after: Connection error");
+    } finally {
+      write.mockRestore();
       restore();
     }
   });
@@ -749,6 +806,26 @@ describe("smoke: /retry command", () => {
       await advance(5000);
 
       expect(attempt).toBeGreaterThanOrEqual(1);
+    } finally {
+      restore();
+    }
+  });
+
+  it("/retry tells the user to switch models for a provider-exhausted error", async () => {
+    const { commands, restore } = await setup();
+    try {
+      const retryHandler = commands["retry"]?.handler;
+      expect(retryHandler).toBeDefined();
+
+      const errorMessage = "This model is unavailable right now (Resource has been exhausted (e.g. check quota).). Next: switch to gemini-3.8-flash or another Flash model.";
+      const ctx = createMockCtx([errorEntry(errorMessage)]);
+
+      await retryHandler!([], ctx);
+
+      expect(ctx.ui.notify).toHaveBeenCalledWith(
+        expect.stringContaining("switch models instead of retrying"),
+        "warning",
+      );
     } finally {
       restore();
     }

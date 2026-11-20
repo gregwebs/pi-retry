@@ -56,6 +56,39 @@ export function formatRetryCountdown(attempt: number, remainingMs: number): stri
 }
 
 /**
+ * Collapse an error message into one short, single-line diagnostic excerpt.
+ *
+ * Provider errors arrive as multi-line blocks (request line, cause, hint),
+ * which would break a one-line stderr report. Squashing whitespace keeps the
+ * actionable first line and the provider's hint on the same line.
+ *
+ * @param errorMessage Raw provider error text, when available.
+ * @param maxLength Maximum length of the returned excerpt.
+ * @returns A trimmed single-line excerpt, or an empty string.
+ */
+export function summarizeError(errorMessage: string | undefined, maxLength = 160): string {
+  const squashed = (errorMessage ?? "").replace(/\s+/g, " ").trim();
+  if (squashed.length <= maxLength) return squashed;
+  return `${squashed.slice(0, maxLength - 1).trimEnd()}…`;
+}
+
+/**
+ * Format the single line a headless host prints when a backoff starts.
+ *
+ * @param label What is about to happen, e.g. "Retry attempt 2".
+ * @param delayMs Milliseconds the extension is about to wait.
+ * @param errorMessage Error that caused the wait, when there is one.
+ * @returns One line naming the action, the wait, and the reason.
+ */
+export function formatWaitNotice(label: string, delayMs: number, errorMessage?: string): string {
+  const reason = summarizeError(errorMessage);
+  const suffix = reason ? ` after: ${reason}` : "";
+  // A zero delay is a queued retry, not a wait; say so instead of "waiting 0ms".
+  if (delayMs <= 0) return `${label}${suffix}`;
+  return `${label} - waiting ${formatDuration(delayMs)}${suffix}`;
+}
+
+/**
  * Get the last assistant message from session entries
  */
 export function getLastAssistantMessage(entries: unknown[]): AgentMessage | undefined {
