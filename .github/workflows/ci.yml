@@ -1,0 +1,51 @@
+name: CI
+
+# Every pull request and every push to main runs the same checks the release
+# workflow depends on, so a regression is caught before it reaches a release
+# commit. Nothing here publishes or has write access: publishing lives in
+# publish.yml and is gated on a version bump.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# A new push to the same pull request supersedes its in-flight run. Pushes to
+# main are never cancelled: they are the record of what landed.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check:
+    name: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          # Matches the Node version the publish workflow releases with, so CI
+          # and the release path agree on the runtime the package ships for.
+          node-version: 24
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit and integration tests
+        run: npm test
+
+      - name: Dead code
+        run: npm run lint:dead
+
+      - name: Host lifecycle regression
+        run: npm run test:host
